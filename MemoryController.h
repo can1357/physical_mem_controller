@@ -230,7 +230,7 @@ struct MemoryController
 		return Pa;
 	}
 
-	void IterPhysRegion( PVOID StartVa, SIZE_T Size, std::function<void( uint64_t, SIZE_T )> Fn )
+	void IterPhysRegion( PVOID StartVa, SIZE_T Size, std::function<void( PVOID Va, uint64_t, SIZE_T )> Fn )
 	{
 		PUCHAR It = ( PUCHAR ) StartVa;
 		PUCHAR End = It + Size;
@@ -244,7 +244,7 @@ struct MemoryController
 
 			uint64_t Pa = VirtToPhys( It );
 
-			Fn( Pa, Size );
+			Fn( It, Pa, Size );
 
 			It += Size;
 		}
@@ -255,7 +255,7 @@ struct MemoryController
 		PUCHAR It = ( PUCHAR ) Dst;
 		SIZE_T BytesRead = 0;
 
-		this->IterPhysRegion( Src, Size, [ & ] ( uint64_t Pa, SIZE_T Sz )
+		this->IterPhysRegion( Src, Size, [ & ] ( PVOID Va, uint64_t Pa, SIZE_T Sz )
 		{
 			if ( Pa )
 			{
@@ -273,7 +273,7 @@ struct MemoryController
 		PUCHAR It = ( PUCHAR ) Src;
 		SIZE_T BytesRead = 0;
 
-		this->IterPhysRegion( Dst, Size, [ & ] ( uint64_t Pa, SIZE_T Sz )
+		this->IterPhysRegion( Dst, Size, [ & ] ( PVOID Va, uint64_t Pa, SIZE_T Sz )
 		{
 			if ( Pa )
 			{
@@ -301,7 +301,7 @@ struct MemoryController
 	}
 };
 
-static MemoryController Mc_InitContext()
+static MemoryController Mc_InitContext( CapcomContext** CpCtxReuse = 0, KernelContext** KrCtxReuse = 0 )
 {
 	assert( Np_LockSections() );
 
@@ -313,7 +313,6 @@ static MemoryController Mc_InitContext()
 
 	Khu_Init( CpCtx, KrCtx );
 	printf( "[+] Mapping physical memory to user-mode!\n" );
-
 
 
 	NON_PAGED_DATA static MemoryController Controller = { 0 };
@@ -408,8 +407,15 @@ static MemoryController Mc_InitContext()
 
 	Controller.TargetDirectoryBase = Controller.CurrentDirectoryBase;
 
-	Cl_FreeContext( CpCtx );
-	Kr_FreeContext( KrCtx );
+	if ( !CpCtxReuse )
+		Cl_FreeContext( CpCtx );
+	else
+		*CpCtxReuse = CpCtx;
+
+	if ( !KrCtxReuse )
+		Kr_FreeContext( KrCtx );
+	else
+		*KrCtxReuse = KrCtx;
 
 	return Controller;
 }
