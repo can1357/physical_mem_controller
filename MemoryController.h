@@ -1,9 +1,9 @@
 #pragma once
 #include <iostream>
-#include <assert.h>
 #include <intrin.h>
 #include <inttypes.h>
 #include <functional>
+#include "Error.h"
 #include "LockedMemory.h"
 #include "KernelRoutines.h"
 #include "CapcomLoader.h"
@@ -148,6 +148,12 @@ typedef struct _PHYSICAL_MEMORY_RANGE
 
 struct MemoryController
 {
+	template<typename T>
+	T& ReadPhysicalUnsafe( uint64_t Pa )
+	{
+		return *( T* ) ( PhysicalMemoryBegin + Pa );
+	}
+
 	PUCHAR PhysicalMemoryBegin;
 	SIZE_T PhysicalMemorySize;
 
@@ -189,42 +195,84 @@ struct MemoryController
 		this->TargetDirectoryBase = this->CurrentDirectoryBase;
 	}
 
-	template<typename T>
-	T& ReadPhysical( uint64_t Pa )
+	
+
+
+	struct PageTableInfo
 	{
-		return *( T* ) ( PhysicalMemoryBegin + Pa );
+		PML4E* Pml4e;
+		PDPTE* Pdpte;
+		PDE* Pde;
+		PTE* Pte;
+	};
+
+	PageTableInfo QueryPageTableInfo( PVOID Va )
+	{
+		PageTableInfo Pi = { 0,0,0,0 };
+
+		VIRT_ADDR Addr = { ( uint64_t ) Va };
+		PTE_CR3 Cr3 = { TargetDirectoryBase };
+
+		{
+			uint64_t a = PFN_TO_PAGE( Cr3.pml4_p ) + sizeof( PML4E ) * Addr.pml4_index;
+			if ( a > this->PhysicalMemorySize )
+				return Pi;
+			PML4E& e = ReadPhysicalUnsafe<PML4E>( a );
+			if ( !e.present )
+				return Pi;
+			Pi.Pml4e = &e;
+		}
+		{
+			uint64_t a = PFN_TO_PAGE( Pi.Pml4e->pdpt_p ) + sizeof( PDPTE ) * Addr.pdpt_index;
+			if ( a > this->PhysicalMemorySize )
+				return Pi;
+			PDPTE& e = ReadPhysicalUnsafe<PDPTE>( a );
+			if ( !e.present )
+				return Pi;
+			Pi.Pdpte = &e;
+		}
+		{
+			uint64_t a = PFN_TO_PAGE( Pi.Pdpte->pd_p ) + sizeof( PDE ) * Addr.pd_index;
+			if ( a > this->PhysicalMemorySize )
+				return Pi;
+			PDE& e = ReadPhysicalUnsafe<PDE>( a );
+			if ( !e.present )
+				return Pi;
+			Pi.Pde = &e;
+			if ( Pi.Pde->page_size )
+				return Pi;
+		}
+		{
+			uint64_t a = PFN_TO_PAGE( Pi.Pde->pt_p ) + sizeof( PTE ) * Addr.pt_index;
+			if ( a > this->PhysicalMemorySize )
+				return Pi;
+			PTE& e = ReadPhysicalUnsafe<PTE>( a );
+			if ( !e.present )
+				return Pi;
+			Pi.Pte = &e;
+		}
+		return Pi;
 	}
 
 	uint64_t VirtToPhys( PVOID Va )
 	{
-		VIRT_ADDR Addr = { ( uint64_t ) Va };
-		PTE_CR3 Cr3 = { TargetDirectoryBase };
+		auto Info = QueryPageTableInfo( Va );
 
-		PML4E Pml4e = ReadPhysical<PML4E>( PFN_TO_PAGE( Cr3.pml4_p ) + sizeof( PML4E ) * Addr.pml4_index );
-		if ( !Pml4e.present )
-			return 0;
-
-		PDPTE Pdpte = ReadPhysical<PDPTE>( PFN_TO_PAGE( Pml4e.pdpt_p ) + sizeof( PDPTE ) * Addr.pdpt_index );
-		if ( !Pdpte.present )
-			return 0;
-
-		PDE Pde = ReadPhysical<PDE>( PFN_TO_PAGE( Pdpte.pd_p ) + sizeof( PDE ) * Addr.pd_index );
-		if ( !Pde.present )
+		if ( !Info.Pde )
 			return 0;
 
 		uint64_t Pa = 0;
 
-		if ( Pde.page_size )
+		if ( Info.Pde->page_size )
 		{
-			Pa = PFN_TO_PAGE( Pde.pt_p );
+			Pa = PFN_TO_PAGE( Info.Pde->pt_p );
 			Pa += ( uint64_t ) Va & ( 0x200000 - 1 );
 		}
 		else
 		{
-			PTE Pte = ReadPhysical<PTE>( PFN_TO_PAGE( Pde.pt_p ) + sizeof( PTE ) * Addr.pt_index );
-			if ( !Pte.present )
+			if ( !Info.Pte )
 				return 0;
-			Pa = PFN_TO_PAGE( Pte.page_frame );
+			Pa = PFN_TO_PAGE( Info.Pte->page_frame );
 			Pa += ( uint64_t ) Va & ( 0x1000 - 1 );
 		}
 		return Pa;
@@ -248,6 +296,13 @@ struct MemoryController
 
 			It += Size;
 		}
+	}
+
+	void AttachIfCanRead( uint64_t EProcess, PVOID Adr )
+	{
+		this->AttachTo( EProcess );
+		if ( !this->VirtToPhys( Adr ) )
+			this->Detach();
 	}
 
 	SIZE_T ReadVirtual( PVOID Src, PVOID Dst, SIZE_T Size )
@@ -316,12 +371,13 @@ static MemoryController Mc_InitContext( CapcomContext** CpCtxReuse = 0, KernelCo
 
 
 	NON_PAGED_DATA static MemoryController Controller = { 0 };
-	NON_PAGED_DATA static uint32_t Pid = GetCurrentProcessId();
 
 	NON_PAGED_DATA static auto k_ZwOpenSection = KrCtx->GetProcAddress<>( "ZwOpenSection" );
 	NON_PAGED_DATA static auto k_ZwMapViewOfSection = KrCtx->GetProcAddress<>( "ZwMapViewOfSection" );
 	NON_PAGED_DATA static auto k_ZwClose = KrCtx->GetProcAddress<>( "ZwClose" );
 	NON_PAGED_DATA static auto k_PsGetCurrentProcess = KrCtx->GetProcAddress<>( "PsGetCurrentProcess" );
+	NON_PAGED_DATA static auto k_PsGetCurrentProcessId = KrCtx->GetProcAddress<>( "PsGetCurrentProcessId" );
+	NON_PAGED_DATA static auto k_PsGetProcessId = KrCtx->GetProcAddress<>( "PsGetProcessId" );
 	NON_PAGED_DATA static auto k_MmGetPhysicalMemoryRanges = KrCtx->GetProcAddress<PPHYSICAL_MEMORY_RANGE( *)( )>( "MmGetPhysicalMemoryRanges" );
 
 	NON_PAGED_DATA static wchar_t PhysicalMemoryName[] = L"\\Device\\PhysicalMemory";
@@ -374,10 +430,19 @@ static MemoryController Mc_InitContext( CapcomContext** CpCtxReuse = 0, KernelCo
 				Controller.CurrentEProcess = k_PsGetCurrentProcess();
 				Controller.CurrentDirectoryBase = __readcr3();
 
+				uint64_t Pid = k_PsGetProcessId( Controller.CurrentEProcess );
+
+				uint32_t PidOffset = *( uint32_t* ) ( ( PUCHAR ) k_PsGetProcessId + 3 );
+				if ( PidOffset < 0x400 && *( uint64_t* ) ( Controller.CurrentEProcess + PidOffset ) == Pid )
+				{
+					Controller.UniqueProcessIdOffset = PidOffset;
+					Controller.ActiveProcessLinksOffset = Controller.UniqueProcessIdOffset + 0x8;
+				}
+
 				for ( int i = 0; i < 0x400; i += 0x8 )
 				{
 					uint64_t* Ptr = (uint64_t*)(Controller.CurrentEProcess + i);
-					if ( !Controller.UniqueProcessIdOffset && Ptr[ 0 ] == Pid && ( Ptr[ 1 ] > 0xffff800000000000 ) && ( Ptr[ 2 ] > 0xffff800000000000 ) && ( ( Ptr[ 1 ] & 0xF ) == ( Ptr[ 2 ] & 0xF ) ) )
+					if ( !Controller.UniqueProcessIdOffset && Ptr[ 0 ] & 0xFFFFFFFF == Pid && ( Ptr[ 1 ] > 0xffff800000000000 ) && ( Ptr[ 2 ] > 0xffff800000000000 ) && ( ( Ptr[ 1 ] & 0xF ) == ( Ptr[ 2 ] & 0xF ) ) )
 					{
 						Controller.UniqueProcessIdOffset = i;
 						Controller.ActiveProcessLinksOffset = Controller.UniqueProcessIdOffset + 0x8;
@@ -392,6 +457,11 @@ static MemoryController Mc_InitContext( CapcomContext** CpCtxReuse = 0, KernelCo
 			k_ZwClose( PhysicalMemoryHandle );
 		}
 	} );
+
+	if ( !Controller.UniqueProcessIdOffset )
+		Controller.CreationStatus = 1;
+	if ( !Controller.DirectoryTableBaseOffset )
+		Controller.CreationStatus = 2;
 
 	printf( "[+] PhysicalMemoryBegin: %16llx\n", Controller.PhysicalMemoryBegin );
 	printf( "[+] PhysicalMemorySize:  %16llx\n", Controller.PhysicalMemorySize );
