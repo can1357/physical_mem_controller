@@ -3,7 +3,6 @@
 #include <intrin.h>
 #include <inttypes.h>
 #include <functional>
-#include "Error.h"
 #include "LockedMemory.h"
 #include "KernelRoutines.h"
 #include "CapcomLoader.h"
